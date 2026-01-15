@@ -1,10 +1,5 @@
 /**
- * sb-parser (Cloudflare Worker - Robust Version)
- * 
- * Update Log:
- * - [Fix] Rewrote SimpleYAML parser to strictly handle nested Inline Flow Style (e.g., - { ... { ... } }).
- * - [Fix] Improved comma splitting logic to respect quotes and nested brackets depth.
- * - [Fix] Added compatibility for unquoted strings in YAML values.
+ * sb-parser (Cloudflare Worker - Ultimate v0.0.1)
  */
 
 export default {
@@ -12,21 +7,55 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === '/parse') {
-      const targetUrl = url.searchParams.get('url');
+      let inputStr = url.searchParams.get('url');
+      if (request.method === 'POST') {
+        inputStr = await request.text();
+      }
+
       const allowLan = url.searchParams.get('lan') === 'true';
 
-      if (!targetUrl) {
-        return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
+      if (!inputStr) {
+        return new Response(JSON.stringify({ error: "Missing 'url' parameter or POST body" }), {
           status: 400,
           headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
         });
       }
 
+      let inputs = [];
+      const trimmedInput = inputStr.trim();
+      
+      if (trimmedInput.startsWith('http://') || trimmedInput.startsWith('https://')) {
+          inputs = trimmedInput.split(/[|,]/).map(u => u.trim()).filter(u => u);
+      } else {
+          inputs = [trimmedInput];
+      }
+
       try {
-        const outbounds = await parseContent(targetUrl, allowLan);
+        const results = await Promise.allSettled(inputs.map(u => parseContent(u, allowLan)));
+        
+        let allOutbounds = [];
+        let errors = [];
+
+        results.forEach((res, index) => {
+          if (res.status === 'fulfilled') {
+            allOutbounds.push(...res.value);
+          } else {
+            const label = inputs.length > 1 && inputs[index].startsWith('http') ? inputs[index] : "Input Content";
+            console.warn(`Failed to parse ${label}: ${res.reason.message}`);
+            errors.push({ source: label, error: res.reason.message });
+          }
+        });
+
+        const finalOutbounds = processTags(allOutbounds);
+
+        if (finalOutbounds.length === 0 && errors.length > 0) {
+           return new Response(JSON.stringify({ error: "Parsing failed", details: errors }), {
+             status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+           });
+        }
+
         return new Response(JSON.stringify({ 
-          outbounds: outbounds,
-          _metadata: { count: outbounds.length, generated_at: new Date().toISOString() }
+          outbounds: finalOutbounds
         }, null, 2), {
           headers: {
             'Content-Type': 'application/json; charset=utf-8',
@@ -34,6 +63,7 @@ export default {
             'Cache-Control': 'no-store'
           }
         });
+
       } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), {
           status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -44,27 +74,26 @@ export default {
     return new Response(`
       <!DOCTYPE html>
       <body style="font-family: system-ui; max-width: 800px; margin: 2rem auto; padding: 1rem;">
-        <h1>🚀 sb-parser (Robust)</h1>
-        <p>Worker Standalone Version with fixed YAML parser.</p>
-        <pre style="background:#f4f4f4;padding:1rem;">/parse?url=SUBSCRIPTION_LINK</pre>
+        <h1>🚀 sb-parser (Ultimate v0.0.32)</h1>
+        <p>Patched: Forced insecure=true for Hysteria v1/v2.</p>
+        <pre style="background:#f4f4f4;padding:1rem;">/parse?url=LINK</pre>
       </body>
     `, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 };
 
 // ============================================================
-// 1. Core Logic
+// 1. Core Logic & Helpers
 // ============================================================
 
 async function parseContent(input, allowLan) {
   let content = input;
 
-  // 1. Download
   if (input.startsWith('http://') || input.startsWith('https://')) {
     if (!allowLan && isLanIP(new URL(input).hostname)) throw new Error("LAN access denied");
     
     const resp = await fetch(input, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (sb-parser/worker)' },
+      headers: { 'User-Agent': 'Clash/1.0 (sb-parser/worker)' },
       redirect: 'follow'
     });
     if (!resp.ok) throw new Error(`Fetch error: ${resp.status}`);
@@ -74,14 +103,13 @@ async function parseContent(input, allowLan) {
   content = content.trim();
   if (!content) throw new Error("Empty content");
 
-  // 2. Base64 Decode
   if (!content.includes('proxies:') && !content.startsWith('{') && !content.startsWith('[') && !content.includes('://')) {
     try { content = safeBase64Decode(content); } catch (e) {}
   }
 
   const nodes = [];
 
-  // 3. Sing-box JSON
+  // 1. JSON Parsing
   if (content.startsWith('{') || content.startsWith('[')) {
     try {
       const json = JSON.parse(content);
@@ -91,7 +119,7 @@ async function parseContent(input, allowLan) {
     } catch(e) {}
   }
 
-  // 4. Clash YAML (Using Robust Simple Parser)
+  // 2. YAML Parsing
   if (content.includes('proxies:')) {
     try {
       const proxies = SimpleYAML.parseProxies(content);
@@ -100,8 +128,11 @@ async function parseContent(input, allowLan) {
           try {
             const n = parseClashProxy(p);
             if (n) {
-               const san = sanitizeNode(n);
-               if(san) nodes.push(san);
+               if (n.type === 'vless') nodes.push(n); 
+               else {
+                   const san = sanitizeNode(n);
+                   if(san) nodes.push(san);
+               }
             }
           } catch(err) {}
         });
@@ -112,7 +143,7 @@ async function parseContent(input, allowLan) {
     }
   }
 
-  // 5. URI List
+  // 3. Line-by-Line Parsing
   const lines = content.split(/\r?\n/);
   for (let line of lines) {
     line = line.trim();
@@ -129,8 +160,11 @@ async function parseContent(input, allowLan) {
       else if (line.startsWith('anytls://')) node = parseAnyTLS(line);
       
       if (node) {
-        const sanitized = sanitizeNode(node);
-        if (sanitized) nodes.push(sanitized);
+        if (node.type === 'vless') nodes.push(node);
+        else {
+            const sanitized = sanitizeNode(node);
+            if (sanitized) nodes.push(sanitized);
+        }
       }
     } catch(e) {}
   }
@@ -140,16 +174,75 @@ async function parseContent(input, allowLan) {
 }
 
 // ============================================================
-// 2. Built-in Robust YAML Parser (State Machine Based)
+// Tag Processing
+// ============================================================
+
+function processTags(nodes) {
+  const seenTags = new Set();
+  const escapeRegExp = (string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  for (const node of nodes) {
+    let oldTag = node.tag || "";
+    const server = node.server || "";
+    const port = String(node.server_port || "");
+    const type = node.type || "";
+
+    let cleanTag = oldTag;
+    const partsToRemove = [
+        `${server}:${port}`,
+        server,
+        port,
+        type,
+        `[${type}]`
+    ];
+
+    partsToRemove.forEach(part => {
+        if (!part) return;
+        try {
+            const regex = new RegExp(escapeRegExp(part), 'gi');
+            cleanTag = cleanTag.replace(regex, '');
+        } catch(e) {}
+    });
+
+    cleanTag = cleanTag.replace(/\[\s*\]/g, ' ')
+                       .replace(/\(\s*\)/g, ' ')
+                       .replace(/\{\s*\}/g, ' ');
+    
+    cleanTag = cleanTag.replace(/\s+[:|\-]+\s+/g, ' '); 
+    cleanTag = cleanTag.replace(/^[:|\-\s]+|[:|\-\s]+$/g, ''); 
+    cleanTag = cleanTag.replace(/\s+/g, ' ').trim();
+
+    let newTag = "";
+    if (cleanTag) newTag += cleanTag + " ";
+    newTag += `${server}:${port}`;
+    newTag += ` [${type}]`; 
+
+    let finalTag = newTag;
+    let counter = 1;
+    while (seenTags.has(finalTag)) {
+       finalTag = `${newTag} (${counter})`;
+       counter++;
+    }
+    
+    seenTags.add(finalTag);
+    node.tag = finalTag;
+  }
+  
+  return nodes;
+}
+
+// ============================================================
+// 2. Built-in Robust YAML Parser
 // ============================================================
 const SimpleYAML = {
   parseProxies(content) {
     const lines = content.split(/\r?\n/);
     const proxies = [];
     let inProxies = false;
-    let currentProxy = null;
+    let currentProxyLines = [];
 
-    for (let line of lines) {
+    for (let i = 0; i < lines.length; i++) {
+      let line = lines[i];
       const commentIdx = line.indexOf('#');
       if (commentIdx !== -1) line = line.substring(0, commentIdx);
       const trimmed = line.trim();
@@ -162,41 +255,48 @@ const SimpleYAML = {
 
       if (inProxies) {
         const currentIndent = line.search(/\S/);
-        // Exit block check
         if (currentIndent === 0 && !trimmed.startsWith('-')) break;
 
         if (trimmed.startsWith('-')) {
-          if (currentProxy) proxies.push(currentProxy);
-          
-          const contentAfterDash = trimmed.substring(1).trim();
-          
-          if (contentAfterDash.startsWith('{')) {
-             // Inline Flow Style: - { name: ... }
-             currentProxy = this.parseInlineObject(contentAfterDash);
-          } else {
-             // Block Style start: - name: ...
-             currentProxy = {};
-             if (contentAfterDash) this.parseLine(contentAfterDash, currentProxy);
+          if (currentProxyLines.length > 0) {
+             proxies.push(this.processProxyBlock(currentProxyLines));
+             currentProxyLines = [];
           }
+          currentProxyLines.push(line);
         } else {
-          // Inside a block property
-          if (currentProxy) {
-             this.parseLine(trimmed, currentProxy);
+          if (currentProxyLines.length > 0) {
+             currentProxyLines.push(line);
           }
         }
       }
     }
-    if (currentProxy && Object.keys(currentProxy).length > 0) proxies.push(currentProxy);
+    if (currentProxyLines.length > 0) {
+       proxies.push(this.processProxyBlock(currentProxyLines));
+    }
     return proxies;
   },
 
-  // Parse a single "key: value" line
+  processProxyBlock(lines) {
+      const raw = lines.join('\n');
+      const obj = { _raw: raw };
+      let firstLine = lines[0].trim().substring(1).trim();
+      if (firstLine.startsWith('{')) {
+          const inline = this.parseInlineObject(firstLine);
+          Object.assign(obj, inline);
+      } else {
+          this.parseLine(firstLine, obj);
+      }
+      for (let i = 1; i < lines.length; i++) {
+          this.parseLine(lines[i].trim(), obj);
+      }
+      return obj;
+  },
+
   parseLine(str, obj) {
     const idx = str.indexOf(':');
     if (idx !== -1) {
       let key = str.substring(0, idx).trim();
       let val = str.substring(idx + 1).trim();
-      // Remove quotes from key
       if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
         key = key.substring(1, key.length - 1);
       }
@@ -204,48 +304,35 @@ const SimpleYAML = {
     }
   },
 
-  // Recursive parser for values (String, Number, Bool, Object, Array)
   parseValue(val) {
     if (!val) return val;
     val = val.trim();
-    
-    // 1. Quoted String
     if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
       return val.substring(1, val.length - 1);
     }
-    // 2. Object { ... }
     if (val.startsWith('{')) return this.parseInlineObject(val);
-    // 3. Array [ ... ]
     if (val.startsWith('[')) return this.parseInlineArray(val);
-    
-    // 4. Boolean / Number
     if (val === 'true') return true;
     if (val === 'false') return false;
-    // Check if it's a pure number (no spaces inside)
-    if (!isNaN(Number(val)) && val !== '' && !val.includes(' ')) return Number(val);
-    
+    if (val === 'null') return null;
+    if (!isNaN(Number(val)) && val !== '') return Number(val);
     return val;
   },
 
-  // State machine to parse "{ k:v, k2:v2 }" robustly
   parseInlineObject(str) {
     str = str.trim();
     if (str.startsWith('{') && str.endsWith('}')) str = str.slice(1, -1);
-    
     const obj = {};
     const parts = this.splitByComma(str);
-    
     for (const part of parts) {
       this.parseLine(part, obj);
     }
     return obj;
   },
 
-  // Parse "[ a, b, c ]"
   parseInlineArray(str) {
     str = str.trim();
     if (str.startsWith('[') && str.endsWith(']')) str = str.slice(1, -1);
-    
     const arr = [];
     const parts = this.splitByComma(str);
     for (const part of parts) {
@@ -254,33 +341,21 @@ const SimpleYAML = {
     return arr;
   },
 
-  // Robust splitter that respects quotes and brackets
   splitByComma(str) {
     const parts = [];
     let buffer = '';
-    let depth = 0; // {} []
+    let depth = 0; 
     let inQuote = false;
     let quoteChar = '';
-    
     for (let i = 0; i < str.length; i++) {
         const c = str[i];
-        
-        // Handle Quotes
         if ((c === '"' || c === "'") && (i === 0 || str[i-1] !== '\\')) {
-            if (!inQuote) {
-                inQuote = true;
-                quoteChar = c;
-            } else if (c === quoteChar) {
-                inQuote = false;
-            }
+            if (!inQuote) { inQuote = true; quoteChar = c; }
+            else if (c === quoteChar) { inQuote = false; }
         }
-        
-        // Handle Brackets (only if not in quote)
         if (!inQuote) {
             if (c === '{' || c === '[') depth++;
             if (c === '}' || c === ']') depth--;
-            
-            // Split condition
             if (c === ',' && depth === 0) {
                 if (buffer.trim()) parts.push(buffer.trim());
                 buffer = '';
@@ -295,8 +370,492 @@ const SimpleYAML = {
 };
 
 // ============================================================
-// 3. Protocol Parsers
+// 3. Helpers
 // ============================================================
+
+function extractNumber(val, def = 0) {
+    if (typeof val === 'number') return val;
+    if (!val) return def;
+    const match = String(val).match(/(\d+)/);
+    return match ? parseInt(match[1]) : def;
+}
+
+function deepFind(obj, keys) {
+    if (!obj) return undefined;
+    for (const k of keys) {
+        if (obj[k] !== undefined && obj[k] !== null && obj[k] !== "") return obj[k];
+    }
+    const nestedKeys = ['tls', 'tls-opts', 'reality-opts', 'realityOpts'];
+    for (const nk of nestedKeys) {
+        if (obj[nk] && typeof obj[nk] === 'object') {
+            for (const k of keys) {
+                 if (obj[nk][k] !== undefined && obj[nk][k] !== null && obj[nk][k] !== "") return obj[nk][k];
+            }
+        }
+    }
+    return undefined;
+}
+
+function isIP(host) {
+    if (!host) return false;
+    return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host) || host.includes(':');
+}
+
+function safeBase64Decode(str) {
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  try { return atob(str); } catch(e) { return atob(str.substring(0, str.length - 1) + '='); } 
+}
+
+function isLanIP(h) {
+    if (h === 'localhost') return true;
+    const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+    if (m) {
+        const p = m.slice(1).map(Number);
+        if (p[0] === 127 || p[0] === 10) return true;
+        if (p[0] === 192 && p[1] === 168) return true;
+        if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+        if (p[0] === 0) return true;
+    }
+    return h === '::1';
+}
+
+function splitHostPort(s) {
+    const idx = s.lastIndexOf(':');
+    if (idx === -1) return { host: s, port: 80 };
+    if (s.includes(']') && idx > s.lastIndexOf(']')) return { host: s.substring(0, idx), port: parseInt(s.substring(idx+1)) };
+    return { host: s.substring(0, idx), port: parseInt(s.substring(idx+1)) };
+}
+
+// ============================================================
+// 4. Global Builders
+// ============================================================
+
+function buildTransport(type, tQuery, path, host, svc) {
+  let t = (type || tQuery || 'tcp').toLowerCase();
+  if (['tcp','udp','xhttp'].includes(t)) return undefined;
+  const trans = {};
+  if (t === 'ws' || t === 'websocket') { trans.type = 'ws'; trans.path = path || '/'; if(host) trans.headers = { Host: host }; }
+  else if (t === 'grpc') { trans.type = 'grpc'; trans.service_name = svc || path; }
+  else if (t === 'http' || t === 'h2') { trans.type = 'http'; trans.path = path; if(host) trans.host = [host]; }
+  else if (t === 'httpupgrade') { trans.type = 'httpupgrade'; trans.path = path; if(host) trans.headers = { Host: host }; }
+  return trans;
+}
+
+function buildTLS(sni, alpn, fp, ins) {
+  const obj = { 
+    enabled: true, 
+    insecure: !!ins
+  };
+  if (sni && typeof sni === 'string' && sni.trim() !== '') {
+      obj.server_name = sni;
+  }
+  if (alpn && alpn.length > 0) obj.alpn = alpn;
+  if (fp) obj.utls = { enabled: true, fingerprint: fp };
+  return obj;
+}
+
+// Wrapper for global consistency
+function buildGlobalTLS(sni, alpn, fp, ins) {
+  return buildTLS(sni, alpn, fp, ins);
+}
+
+function sanitizeNode(node) {
+  if (!node) return null;
+  const m = {
+      'ss':'shadowsocks','vmess':'vmess','vless':'vless','trojan':'trojan',
+      'hysteria2':'hysteria2','hy2':'hysteria2','hysteria':'hysteria','tuic':'tuic',
+      'anytls':'anytls', 'shadowtls':'shadowtls', 'shadowtls-v3':'shadowtls-v3'
+  };
+  let type = (node.type || '').toLowerCase();
+  if (!m[type] && type !== 'shadowsocks') return null;
+  node.type = m[type];
+  if (!node.tag) node.tag = `${node.type}-${node.server}`;
+  if (!node.transport) delete node.transport;
+  if (!node.tls) delete node.tls;
+  if (node.transport && node.transport.type === 'ws' && node.tls) {
+      node.tls.record_fragment = true;
+      if (!node.tls.utls) node.tls.utls = { enabled: true, fingerprint: 'chrome' };
+  }
+  
+  const clean = (obj) => {
+      Object.keys(obj).forEach(k => {
+          if (obj[k] && typeof obj[k] === 'object') clean(obj[k]);
+          if (obj[k] === undefined || obj[k] === null || obj[k] === "") delete obj[k];
+      });
+  };
+  clean(node);
+  return node;
+}
+
+// ============================================================
+// 5. Protocol Parsers
+// ============================================================
+
+function parseClashProxy(p) {
+    if (!p || typeof p !== 'object') return null;
+    
+    // Type Normalization
+    let type = (p.type || "").toLowerCase();
+    if (type === 'hy2') type = 'hysteria2';
+    if (type === 'ss') type = 'shadowsocks';
+    if (type === 'tuic-v5') type = 'tuic';
+
+    const raw = p._raw || "";
+    const findInRaw = (regex) => {
+        const m = raw.match(regex);
+        return m ? m[1] : null;
+    };
+
+    // --- VLESS BRANCH ---
+    if (type === 'vless') {
+        const rawSNI = 
+            p.sni || 
+            p['server-name'] || 
+            p.server_name || 
+            p.servername || 
+            findInRaw(/(?:sni|server-name|servername|host)\s*:\s*['"]?([^'"\s\n]+)['"]?/i);
+        
+        const rawFlow = p.flow || findInRaw(/flow\s*:\s*['"]?([^'"\s\n]+)['"]?/i);
+        
+        let realityOpts = p['reality-opts'] || p.realityOpts || {};
+        const pbk = realityOpts['public-key'] || realityOpts.publicKey || p['public-key'] || p.publicKey || findInRaw(/(?:public-key|pbk)\s*:\s*([^ \n]+)/i);
+        const sid = realityOpts['short-id'] || realityOpts.shortId || p['short-id'] || p.shortId || findInRaw(/(?:short-id|sid)\s*:\s*([^ \n]+)/i);
+        
+        let realityObj = undefined;
+        if (pbk) {
+            realityObj = { public_key: pbk, short_id: sid };
+        }
+
+        let explicitInsecure = false;
+        if (p['skip-cert-verify'] === true || p.insecure === true || p['allow-insecure'] === true) explicitInsecure = true;
+        if (!explicitInsecure && (/skip-cert-verify\s*:\s*(true|1)/i.test(raw) || /insecure\s*:\s*(true|1)/i.test(raw))) explicitInsecure = true;
+
+        const vlessInput = {
+            tag: p.name,
+            server: p.server,
+            port: Number(p.port),
+            uuid: p.uuid,
+            flow: (rawFlow && rawFlow !== 'null' && rawFlow !== 'none') ? rawFlow : undefined,
+            network: p.network || 'tcp',
+            tls: !!p.tls,
+            insecure: explicitInsecure,
+            sni: rawSNI,
+            reality: realityObj,
+            ws_opts: p['ws-opts'],
+            grpc_opts: p['grpc-opts'],
+            utls_fingerprint: p['client-fingerprint'] || 'chrome'
+        };
+
+        return convertVLESS(vlessInput);
+    }
+
+    // --- OTHER PROTOCOLS ---
+    
+    const node = { tag: p.name, server: p.server, server_port: Number(p.port), type: type };
+
+    let rawInsecure = null;
+    if (p['skip-cert-verify'] === true || p.insecure === true) rawInsecure = true;
+    else if (/skip-cert-verify\s*:\s*(true|1)/i.test(raw)) rawInsecure = true;
+    else if (/insecure\s*:\s*(true|1)/i.test(raw)) rawInsecure = true;
+    else if (/allow-insecure\s*:\s*(true|1)/i.test(raw)) rawInsecure = true;
+    else if (/skip-cert-verify\s*:\s*(false|0)/i.test(raw)) rawInsecure = false;
+    else if (/insecure\s*:\s*(false|0)/i.test(raw)) rawInsecure = false;
+
+    const getFinalInsecure = (protoType) => {
+        if (rawInsecure !== null) return rawInsecure;
+        // Strict logic: No defaults for Hy/Tuic
+        return false;
+    };
+
+    let extractedSNI = p.sni || p['server-name'] || p.server_name || p.servername || findInRaw(/(?:sni|server-name|servername|host)\s*:\s*['"]?([^'"\s\n]+)['"]?/i);
+    if (extractedSNI && isIP(extractedSNI)) extractedSNI = undefined;
+
+    const getFinalSNI = (protoType) => {
+        if (extractedSNI) return extractedSNI;
+        
+        // AnyTLS: Allow IP fallback (Compatibility)
+        if (protoType === 'anytls') return p.server;
+        
+        // Hysteria/Tuic: DO NOT fallback to apple.com
+        
+        // Standard: Fallback only if Domain
+        if (p.server && !isIP(p.server)) return p.server;
+        
+        return undefined;
+    };
+
+    const rawUp = extractNumber(p.up_mbps ?? p.up ?? findInRaw(/(?:up|up-mbps|up_mbps)\s*:\s*(\d+)/i));
+    const rawDown = extractNumber(p.down_mbps ?? p.down ?? findInRaw(/(?:down|down-mbps|down_mbps)\s*:\s*(\d+)/i));
+    const up_mbps = (type === 'hysteria' ? (rawUp > 0 ? rawUp : 11) : (rawUp > 0 ? rawUp : 55));
+    const down_mbps = rawDown > 0 ? rawDown : 55;
+
+    const buildProxyTLS = (protoType, alpnDefault) => {
+        const sni = getFinalSNI(protoType);
+        const insecure = getFinalInsecure(protoType);
+        const alpn = 
+            Array.isArray(p.alpn) && p.alpn.length > 0 
+                ? p.alpn 
+                : (['hysteria2', 'hysteria', 'tuic'].includes(protoType) ? ['h3'] : alpnDefault);
+        const fp = p['client-fingerprint'] || findInRaw(/client-fingerprint\s*:\s*([^ \n]+)/i);
+        return buildGlobalTLS(sni, alpn, fp, insecure);
+    };
+
+    if (['ss', 'shadowsocks'].includes(type)) {
+        node.type = 'shadowsocks'; node.method = p.cipher; node.password = p.password;
+        if (p.plugin) {
+            node.plugin = p.plugin;
+            if (p['plugin-opts']) {
+                if (typeof p['plugin-opts'] === 'object') {
+                    node.plugin_opts = Object.entries(p['plugin-opts']).map(([k,v])=>`${k}=${v}`).join(';');
+                } else {
+                    node.plugin_opts = String(p['plugin-opts']);
+                }
+            }
+        }
+    } 
+    else if (type === 'vmess') {
+        node.uuid = p.uuid; node.security = p.cipher || 'auto'; node.alter_id = p.alterId || 0; node.packet_encoding = 'xudp';
+        const net = p.network || 'tcp'; const opts = p[`${net}-opts`] || {};
+        node.transport = buildTransport(net, null, opts.path, opts.headers?.Host, opts['grpc-service-name']);
+        if (p.tls) {
+            node.tls = buildProxyTLS('vmess');
+            if (net === 'ws') node.tls.record_fragment = true;
+        }
+    } 
+    else if (type === 'hysteria2') {
+        node.type = 'hysteria2'; node.password = p.password; 
+        node.up_mbps = up_mbps; node.down_mbps = down_mbps;
+        if(p.obfs) node.obfs = { type: p.obfs, password: p['obfs-password'] };
+        
+        // [Diff] Manual Hy2 TLS
+        const alpn = Array.isArray(p.alpn) && p.alpn.length > 0 ? p.alpn : ['h3'];
+        const sni = p.sni || p.serverName || p['server-name'] || undefined;
+        // hysteria v2: force skip cert verify
+        node.tls = buildGlobalTLS(sni, alpn, null, true);
+    } 
+    else if (type === 'hysteria') {
+        node.type = 'hysteria'; 
+        node.auth_str = deepFind(p, ['auth-str', 'auth_str']); 
+        node.up_mbps = up_mbps; 
+        node.down_mbps = down_mbps;
+        node.disable_mtu_discovery = p.disable_mtu_discovery ?? false;
+        
+        // [Diff] Manual Hy1 TLS
+        const alpn = Array.isArray(p.alpn) && p.alpn.length > 0 ? p.alpn : ['h3'];
+        const sni = p.sni || p.serverName || p['server-name'] || undefined;
+        // hysteria v1: force skip cert verify
+        node.tls = buildGlobalTLS(sni, alpn, null, true);
+    } 
+    else if (type === 'tuic') {
+        node.type = 'tuic'; 
+        node.uuid = p.uuid; 
+        node.password = p.password || p.token;
+        
+        // [Diff] TUIC fields
+        node.congestion_control = p['congestion-controller'] || undefined;
+        node.zero_rtt_handshake = p['reduce-rtt'] ?? p.zero_rtt_handshake ?? undefined;
+        
+        const finalSNI = getFinalSNI('tuic') || p.sni || 'apple.com'; // User's diff kept explicit 'apple.com' fallback here specifically for TUIC in the diff block provided
+        const alpn = Array.isArray(p.alpn) && p.alpn.length > 0 ? p.alpn : ['h3'];
+        // Force insecure per user diff for TUIC specifically
+        node.tls = buildGlobalTLS(finalSNI, alpn, null, true);
+    } 
+    else if (type === 'anytls') {
+        node.type = 'anytls'; 
+        node.password = p.password;
+        
+        // [Diff] AnyTLS
+        const alpn = Array.isArray(p.alpn) && p.alpn.length > 0 ? p.alpn : undefined;
+        // Force insecure per diff
+        node.tls = buildGlobalTLS(p.server, alpn, p['client-fingerprint'], true);
+    } 
+    else if (type === 'trojan') {
+        node.type = 'trojan'; node.password = p.password;
+        const net = p.network || 'tcp'; const opts = p[`${net}-opts`] || {};
+        node.transport = buildTransport(net, null, opts.path, opts.headers?.Host, opts['grpc-service-name']);
+        node.tls = buildProxyTLS('trojan');
+        if (net === 'ws') node.tls.record_fragment = true;
+    }
+    
+    return ['shadowsocks','vmess','vless','trojan','hysteria2','hysteria','tuic','anytls'].includes(node.type) ? node : null;
+}
+
+// ============================================================
+// VLESS Converter (Strict Logic)
+// ============================================================
+
+function resolveSNI({ explicitSNI, server, isReality }) {
+  if (explicitSNI) return explicitSNI;
+  if (isReality) return undefined; 
+  if (server && !isIP(server)) return server; 
+  return undefined;
+}
+
+function buildVLESSTLS({ sni, reality, utls, insecure }) {
+  const tls = { enabled: true };
+  if (sni) tls.server_name = sni;
+  if (insecure) tls.insecure = true;
+  if (utls) tls.utls = utls;
+  if (reality) tls.reality = reality;
+  return tls;
+}
+
+function convertVLESS(input) {
+  const {
+    tag, server, port, uuid, flow, network, tls, insecure, sni, reality,
+    ws_opts, grpc_opts, utls_fingerprint,
+  } = input;
+
+  const isReality = Boolean(reality && reality.public_key);
+  const finalSNI = resolveSNI({ explicitSNI: sni, server, isReality });
+
+  const outbound = {
+    tag: tag,
+    type: "vless",
+    server,
+    server_port: port,
+    uuid,
+    packet_encoding: "xudp",
+  };
+
+  if (flow && flow !== 'null' && flow !== 'none') {
+      outbound.flow = flow;
+  }
+
+  if (network === "ws") {
+    outbound.transport = {
+      type: "ws",
+      path: ws_opts?.path || "/",
+      headers: ws_opts?.headers || {},
+    };
+  } else if (network === "grpc") {
+    outbound.transport = {
+      type: "grpc",
+      service_name: grpc_opts?.service_name || "",
+    };
+  }
+
+  if (tls || isReality) {
+    outbound.tls = buildVLESSTLS({
+      sni: finalSNI,
+      insecure: insecure,
+      utls: utls_fingerprint ? { enabled: true, fingerprint: utls_fingerprint } : undefined,
+      reality: isReality ? { enabled: true, public_key: reality.public_key, short_id: reality.short_id } : undefined,
+    });
+  }
+
+  return outbound;
+}
+
+// ============================================================
+// URL Parsers
+// ============================================================
+
+function parseHysteria2(uri) {
+  const { u, q, fragment } = parseUrlObj(uri);
+  const up = extractNumber(q.get('up_mbps') || q.get('up'));
+  const down = extractNumber(q.get('down_mbps') || q.get('down'));
+  const node = {
+    type: 'hysteria2', tag: fragment || `Hy2-${u.hostname}`, server: u.hostname, server_port: parseInt(u.port),
+    password: u.password || u.username, 
+    up_mbps: up > 0 ? up : 55, down_mbps: down > 0 ? down : 55
+  };
+  if(q.get('obfs') && q.get('obfs')!=='none') node.obfs = { type: q.get('obfs'), password: q.get('obfs-password') };
+  const alpn = q.get('alpn') ? q.get('alpn').split(',') : ['h3'];
+  let sni = q.get('sni') || q.get('peer') || q.get('serverName');
+  if (sni && isIP(sni)) sni = undefined;
+  if (!sni && !isIP(u.hostname)) sni = u.hostname;
+  let ins = false;
+  if (q.has('insecure') && (q.get('insecure')==='1'||q.get('insecure')==='true')) ins = true;
+  node.tls = buildTLS(sni, alpn, null, ins); 
+  return node;
+}
+
+function parseHysteria1(uri) {
+  const { u, q, fragment } = parseUrlObj(uri);
+  const up = extractNumber(q.get('up') || q.get('up_mbps'));
+  const down = extractNumber(q.get('down') || q.get('down_mbps'));
+  const node = {
+    type: 'hysteria', tag: fragment || `Hysteria-${u.hostname}`, server: u.hostname, server_port: parseInt(u.port),
+    auth_str: q.get('auth') || u.username,
+    up_mbps: up > 0 ? up : 11, down_mbps: down > 0 ? down : 55,
+    disable_mtu_discovery: true
+  };
+  const alpn = q.get('alpn') ? q.get('alpn').split(',') : ['h3'];
+  let sni = q.get('sni') || q.get('peer') || q.get('serverName');
+  if (sni && isIP(sni)) sni = undefined;
+  if (!sni && !isIP(u.hostname)) sni = u.hostname;
+  let ins = false;
+  if (q.has('insecure') && (q.get('insecure')==='1'||q.get('insecure')==='true')) ins = true;
+  node.tls = buildTLS(sni, alpn, null, ins);
+  return node;
+}
+
+function parseTuic(uri) {
+  const { u, q, fragment } = parseUrlObj(uri);
+  const node = {
+    type: 'tuic', tag: fragment || `Tuic-${u.hostname}`, server: u.hostname, server_port: parseInt(u.port),
+    uuid: u.username, password: u.password, congestion_control: 'bbr', zero_rtt_handshake: true
+  };
+  const alpn = q.get('alpn') ? q.get('alpn').split(',') : ['h3'];
+  let sni = q.get('sni') || q.get('peer') || q.get('serverName');
+  if (sni && isIP(sni)) sni = undefined;
+  if (!sni && !isIP(u.hostname)) sni = u.hostname;
+  let ins = false;
+  if (q.has('insecure') && (q.get('insecure')==='1'||q.get('insecure')==='true')) ins = true;
+  node.tls = buildTLS(sni, alpn, null, ins);
+  return node;
+}
+
+function parseAnyTLS(uri) {
+  const { u, q, fragment } = parseUrlObj(uri);
+  let pwd = u.username; if (u.password) pwd = u.password;
+  const node = {
+    type: 'anytls', tag: fragment || `AnyTLS-${u.hostname}`, server: u.hostname, server_port: parseInt(u.port),
+    password: pwd
+  };
+  let sni = q.get('sni') || q.get('peer') || q.get('serverName') || u.hostname;
+  let ins = false;
+  if (q.has('insecure') && (q.get('insecure')==='1'||q.get('insecure')==='true')) ins = true;
+  node.tls = buildTLS(sni, undefined, null, ins);
+  return node;
+}
+
+function parseVLESS(uri) {
+  const { u, q, fragment } = parseUrlObj(uri);
+  const flowVal = q.get('flow');
+  
+  let realityObj = undefined;
+  if (q.get('security') === 'reality' || q.has('pbk') || q.has('publicKey')) {
+      realityObj = {
+          public_key: q.get('pbk') || q.get('publicKey'),
+          short_id: q.get('sid') || q.get('shortId')
+      };
+  }
+
+  let ins = false;
+  if (q.has('insecure') && (q.get('insecure') === '1' || q.get('insecure') === 'true')) ins = true;
+  if (q.has('allowInsecure') && (q.get('allowInsecure') === '1' || q.get('allowInsecure') === 'true')) ins = true;
+
+  const vlessInput = {
+      tag: fragment || `VLESS-${u.hostname}`,
+      server: u.hostname,
+      port: parseInt(u.port),
+      uuid: u.username,
+      flow: (flowVal && flowVal !== 'null' && flowVal !== 'none') ? flowVal : undefined,
+      network: q.get('type') || 'tcp',
+      tls: q.get('security') === 'tls' || q.get('security') === 'xtls' || !!realityObj,
+      insecure: ins,
+      sni: q.get('sni') || q.get('peer') || q.get('serverName'),
+      reality: realityObj,
+      ws_opts: { path: q.get('path'), headers: q.get('host') ? { Host: q.get('host') } : undefined },
+      grpc_opts: { service_name: q.get('serviceName') },
+      utls_fingerprint: q.get('fp') || 'chrome'
+  };
+
+  return convertVLESS(vlessInput);
+}
 
 function parseSS(uri) {
   let raw = uri.substring(5);
@@ -388,233 +947,15 @@ function parseVMess(uri) {
   return node;
 }
 
-function parseVLESS(uri) {
-  const { u, q, fragment } = parseUrlObj(uri);
-  const node = {
-    type: 'vless', tag: fragment || `VLESS-${u.hostname}`, server: u.hostname, server_port: parseInt(u.port),
-    uuid: u.username, flow: q.get('flow'), packet_encoding: 'xudp'
-  };
-  const security = q.get('security');
-  node.transport = buildTransport(q.get('type'), q.get('headerType'), q.get('path'), q.get('host'), q.get('serviceName'));
-  if (node.transport && node.transport.type === 'ws') node.packet_encoding = undefined;
-
-  if (security === 'reality') {
-    node.tls = {
-      enabled: true, server_name: q.get('sni') || q.get('peer'),
-      utls: { enabled: true, fingerprint: q.get('fp') || 'chrome' },
-      reality: { enabled: true, public_key: q.get('pbk'), short_id: q.get('sid') }
-    };
-  } else if (security === 'tls' || security === 'xtls') {
-    node.tls = buildTLS(q.get('sni') || q.get('peer') || u.hostname, null, q.get('fp'), true);
-    if (node.transport && node.transport.type === 'ws') node.tls.record_fragment = true;
-  }
-  return node;
-}
-
 function parseTrojan(uri) {
   const { u, q, fragment } = parseUrlObj(uri);
   const node = {
     type: 'trojan', tag: fragment || `Trojan-${u.hostname}`, server: u.hostname, server_port: parseInt(u.port), password: u.username
   };
   node.transport = buildTransport(q.get('type'), null, q.get('path'), q.get('host'), q.get('serviceName'));
-  node.tls = buildTLS(q.get('sni') || q.get('peer') || u.hostname, q.get('alpn') ? q.get('alpn').split(',') : undefined, q.get('fp'), q.get('allowInsecure') === '1');
+  let ins = false;
+  if (q.has('allowInsecure') && (q.get('allowInsecure') === '1' || q.get('allowInsecure') === 'true')) ins = true;
+  node.tls = buildTLS(q.get('sni') || q.get('peer') || u.hostname, q.get('alpn') ? q.get('alpn').split(',') : undefined, q.get('fp'), ins);
   if (node.transport && node.transport.type === 'ws') node.tls.record_fragment = true;
   return node;
-}
-
-function parseHysteria2(uri) {
-  const { u, q, fragment } = parseUrlObj(uri);
-  let auth = u.username; if(u.password) auth = u.password;
-  const node = {
-    type: 'hysteria2', tag: fragment || `Hy2-${u.hostname}`, server: u.hostname, server_port: parseInt(u.port),
-    password: auth, up_mbps: 100, down_mbps: 100
-  };
-  if(q.get('obfs') && q.get('obfs')!=='none') node.obfs = { type: q.get('obfs'), password: q.get('obfs-password') };
-  node.tls = buildTLS(q.get('sni')||u.hostname, q.get('alpn')?q.get('alpn').split(','):undefined, null, q.get('insecure')==='1');
-  return node;
-}
-
-function parseHysteria1(uri) {
-  const { u, q, fragment } = parseUrlObj(uri);
-  const node = {
-    type: 'hysteria', tag: fragment || `Hysteria-${u.hostname}`, server: u.hostname, server_port: parseInt(u.port),
-    auth_str: q.get('auth') || u.username,
-    up_mbps: parseInt(q.get('up') || q.get('up_mbps') || 100), 
-    down_mbps: parseInt(q.get('down') || q.get('down_mbps') || 100),
-    disable_mtu_discovery: true
-  };
-  const sni = q.get('sni') || q.get('peer') || u.hostname;
-  const alpn = q.get('alpn') ? q.get('alpn').split(',') : ['h3'];
-  node.tls = buildTLS(sni, alpn, null, q.get('insecure')==='1');
-  return node;
-}
-
-function parseTuic(uri) {
-  const { u, q, fragment } = parseUrlObj(uri);
-  const node = {
-    type: 'tuic', tag: fragment || `Tuic-${u.hostname}`, server: u.hostname, server_port: parseInt(u.port),
-    uuid: u.username, password: u.password, congestion_control: 'bbr', zero_rtt_handshake: true
-  };
-  node.tls = buildTLS(q.get('sni')||u.hostname, q.get('alpn')?q.get('alpn').split(','):['h3'], null, false);
-  return node;
-}
-
-function parseAnyTLS(uri) {
-  const { u, q, fragment } = parseUrlObj(uri);
-  let pwd = u.username;
-  if (u.password) pwd = u.password;
-  const node = {
-    type: 'anytls', tag: fragment || `AnyTLS-${u.hostname}`, server: u.hostname, server_port: parseInt(u.port),
-    password: pwd
-  };
-  const sni = q.get('sni') || u.hostname;
-  node.tls = buildTLS(sni, null, null, false);
-  return node;
-}
-
-function parseClashProxy(p) {
-    if (!p || typeof p !== 'object') return null;
-    const type = (p.type || "").toLowerCase();
-    const node = { tag: p.name, server: p.server, server_port: Number(p.port), type };
-    
-    if (['ss', 'shadowsocks'].includes(type)) {
-        node.type = 'shadowsocks'; node.method = p.cipher; node.password = p.password;
-        if (p.plugin) {
-            node.plugin = p.plugin;
-            // Fix: handle plugin-opts being an object (Inline Flow) or raw string
-            if (p['plugin-opts']) {
-                if (typeof p['plugin-opts'] === 'object') {
-                    node.plugin_opts = Object.entries(p['plugin-opts']).map(([k,v])=>`${k}=${v}`).join(';');
-                } else {
-                    node.plugin_opts = String(p['plugin-opts']);
-                }
-            }
-        }
-    } else if (type === 'vmess') {
-        node.uuid = p.uuid; node.security = p.cipher || 'auto'; node.alter_id = p.alterId || 0; node.packet_encoding = 'xudp';
-        const net = p.network || 'tcp'; 
-        const opts = p[`${net}-opts`] || {};
-        node.transport = buildTransport(net, null, opts.path, opts.headers?.Host, opts['grpc-service-name']);
-        if (p.tls) {
-            node.tls = buildTLS(p.servername || p.server, p.alpn, p['client-fingerprint'], p['skip-cert-verify']);
-            if (net === 'ws') node.tls.record_fragment = true;
-        }
-    } else if (type === 'vless') {
-        node.uuid = p.uuid; node.flow = p.flow; node.packet_encoding = 'xudp';
-        const net = p.network || 'tcp'; const opts = p[`${net}-opts`] || {};
-        node.transport = buildTransport(net, null, opts.path, opts.headers?.Host, opts['grpc-service-name']);
-        if (p.tls) {
-            const sni = p.servername || p.server;
-            if (p['reality-opts']) {
-                 const ro = p['reality-opts'];
-                 node.tls = { enabled: true, server_name: sni, utls: { enabled: true, fingerprint: p['client-fingerprint'] || 'chrome' }, reality: { enabled: true, public_key: ro['public-key'], short_id: ro['short-id'] } };
-            } else {
-                 node.tls = buildTLS(sni, p.alpn, p['client-fingerprint'], p['skip-cert-verify']);
-                 if(net==='ws') node.tls.record_fragment = true;
-            }
-        }
-        if(net==='ws') node.packet_encoding = undefined;
-    } else if (type === 'hysteria2') {
-        node.type = 'hysteria2'; node.password = p.password; node.up_mbps = p.up || 100; node.down_mbps = p.down || 100;
-        if(p.obfs) node.obfs = { type: p.obfs, password: p['obfs-password'] };
-        node.tls = buildTLS(p.sni || p.server, p.alpn, p['client-fingerprint'], p['skip-cert-verify']);
-    } else if (type === 'hysteria') {
-        node.type = 'hysteria'; 
-        node.auth_str = p['auth-str'] || p.auth_str; 
-        node.up_mbps = p.up || p.up_mbps || 100; 
-        node.down_mbps = p.down || p.down_mbps || 100;
-        node.disable_mtu_discovery = false;
-        node.tls = buildTLS(p.sni || p.server, p.alpn, p['client-fingerprint'], p['skip-cert-verify']);
-    } else if (type === 'tuic') {
-        node.type = 'tuic'; 
-        node.uuid = p.uuid; 
-        node.password = p.password || p.token;
-        node.congestion_control = 'bbr'; 
-        node.zero_rtt_handshake = true;
-        const alpn = p.alpn && p.alpn.length > 0 ? p.alpn : ['h3'];
-        node.tls = buildTLS(p.sni || p.server, alpn, p['client-fingerprint'], p['skip-cert-verify']);
-    } else if (type === 'anytls') {
-        node.type = 'anytls'; 
-        node.password = p.password;
-        node.tls = buildTLS(p.sni || p.server, null, null, p['skip-cert-verify']);
-    } else if (type === 'trojan') {
-        node.type = 'trojan'; node.password = p.password;
-        const net = p.network || 'tcp'; const opts = p[`${net}-opts`] || {};
-        node.transport = buildTransport(net, null, opts.path, opts.headers?.Host, opts['grpc-service-name']);
-        node.tls = buildTLS(p.sni || p.server, p.alpn, p['client-fingerprint'], p['skip-cert-verify']);
-        if (net === 'ws') node.tls.record_fragment = true;
-    }
-    
-    return ['shadowsocks','vmess','vless','trojan','hysteria2','hysteria','tuic','anytls'].includes(node.type) ? node : null;
-}
-
-// ============================================================
-// 4. Utils
-// ============================================================
-
-function buildTransport(type, tQuery, path, host, svc) {
-  let t = (type || tQuery || 'tcp').toLowerCase();
-  if (['tcp','udp','xhttp'].includes(t)) return undefined;
-  const trans = {};
-  if (t === 'ws' || t === 'websocket') { trans.type = 'ws'; trans.path = path || '/'; if(host) trans.headers = { Host: host }; }
-  else if (t === 'grpc') { trans.type = 'grpc'; trans.service_name = svc || path; }
-  else if (t === 'http' || t === 'h2') { trans.type = 'http'; trans.path = path; if(host) trans.host = [host]; }
-  else if (t === 'httpupgrade') { trans.type = 'httpupgrade'; trans.path = path; if(host) trans.headers = { Host: host }; }
-  return trans;
-}
-
-function buildTLS(sni, alpn, fp, ins) {
-  return { enabled: true, server_name: sni, insecure: !!ins, alpn: alpn, utls: fp ? { enabled: true, fingerprint: fp } : undefined };
-}
-
-function sanitizeNode(node) {
-  if (!node) return null;
-  const m = {
-      'ss':'shadowsocks','vmess':'vmess','vless':'vless','trojan':'trojan',
-      'hysteria2':'hysteria2','hy2':'hysteria2','hysteria':'hysteria','tuic':'tuic',
-      'anytls':'anytls', 'shadowtls':'shadowtls', 'shadowtls-v3':'shadowtls-v3'
-  };
-  let type = (node.type || '').toLowerCase();
-  if (!m[type] && type !== 'shadowsocks') return null;
-  node.type = m[type];
-  if (!node.tag) node.tag = `${node.type}-${node.server}`;
-  if (!node.transport) delete node.transport;
-  if (!node.tls) delete node.tls;
-  if (node.transport && node.transport.type === 'ws' && node.tls) {
-      node.tls.record_fragment = true;
-      if (!node.tls.utls) node.tls.utls = { enabled: true, fingerprint: 'chrome' };
-  }
-  Object.keys(node).forEach(k => (node[k] === undefined || node[k] === null || node[k] === "") && delete node[k]);
-  return node;
-}
-
-function parseUrlObj(uri) {
-  try { const u = new URL(uri); return { u, q: u.searchParams, fragment: decodeURIComponent(u.hash.substring(1)) }; } 
-  catch(e) { throw new Error("Invalid URI"); }
-}
-
-function splitHostPort(s) {
-    const idx = s.lastIndexOf(':');
-    if (idx === -1) return { host: s, port: 80 };
-    if (s.includes(']') && idx > s.lastIndexOf(']')) return { host: s.substring(0, idx), port: parseInt(s.substring(idx+1)) };
-    return { host: s.substring(0, idx), port: parseInt(s.substring(idx+1)) };
-}
-
-function safeBase64Decode(str) {
-  str = str.replace(/-/g, '+').replace(/_/g, '/');
-  while (str.length % 4) str += '=';
-  try { return atob(str); } catch(e) { return atob(str.substring(0, str.length - 1) + '='); } // simple fix padding
-}
-
-function isLanIP(h) {
-    if (h === 'localhost') return true;
-    const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-    if (m) {
-        const p = m.slice(1).map(Number);
-        if (p[0] === 127 || p[0] === 10) return true;
-        if (p[0] === 192 && p[1] === 168) return true;
-        if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
-        if (p[0] === 0) return true;
-    }
-    return h === '::1';
 }
