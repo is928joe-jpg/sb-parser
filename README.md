@@ -1,4 +1,4 @@
-The project documentation, including the **User Guide** and the **Protocol Extension Proposal**.
+Project documentation, including the **User Guide** and the **Protocol Extension Proposal**.
 
 ---
 
